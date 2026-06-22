@@ -157,17 +157,19 @@ impl Registry {
     }
 }
 
-/// Resolve a per-user config directory without pulling in another dependency surface than `ce-rs`
-/// already exposes. `ce-rs` re-exports nothing for this, so use the same `directories` crate it
-/// uses transitively via a tiny shim. We avoid a hard dependency by falling back to `$HOME`.
+/// Resolve a per-user config directory. Honors `XDG_CONFIG_HOME` first (explicit override on any
+/// platform), then falls back to the platform-native config dir via the `directories` crate. This
+/// is cross-platform: on Windows `$HOME` is typically unset (the relevant vars are `USERPROFILE`
+/// / `%APPDATA%`), so a hardcoded `$HOME/.config` would yield `None` there. `ProjectDirs` resolves
+/// `%APPDATA%\ce\ce-fn\config` on Windows, `~/Library/Application Support/...` on macOS, and the
+/// XDG default on Linux.
 fn directories_config_dir() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("XDG_CONFIG_HOME")
         && !home.trim().is_empty()
     {
         return Some(PathBuf::from(home));
     }
-    let home = std::env::var("HOME").ok().filter(|h| !h.trim().is_empty())?;
-    Some(PathBuf::from(home).join(".config"))
+    directories::ProjectDirs::from("net", "ce", "ce-fn").map(|p| p.config_dir().to_path_buf())
 }
 
 #[cfg(test)]
