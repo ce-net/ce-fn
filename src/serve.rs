@@ -309,98 +309,57 @@ impl<R: HandlerRuntime> Runtime<R> {
     }
 }
 
-/// Run the serve loop forever (until `shutdown`): subscribe to the invoke topic and answer each
-/// request from the node's message stream. Refreshes the on-chain revoked set periodically. This is
-/// the body of `ce-fn serve`; it requires a live local node.
+/// Run the serve loop forever (until `shutdown`): answer each `ce-fn/invoke` request from the node's
+/// message stream. The subscribe + stream + de-dup + reply + reconnect mechanics are delegated to the
+/// shared [`ce_rs::serve`] loop; this module supplies only the invoke-specific [`InvokeHandler`]
+/// (capability authorization, secret resolution, handler execution). Requires a live local node.
 pub async fn serve_loop<R: HandlerRuntime>(
     ce: &ce_rs::CeClient,
     runtime: &Runtime<R>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
-    use futures_util::StreamExt as _;
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
-    ce.subscribe(crate::protocol::INVOKE_TOPIC).await?;
-
-    // On-chain revoked (issuer, nonce) set, refreshed in the background every ~10s.
+    // On-chain revoked (issuer, nonce) set, seeded now and refreshed lazily (>=10s) on the request
+    // path by the handler.
     let revoked: Arc<Mutex<HashSet<(NodeId, u64)>>> = Arc::new(Mutex::new(HashSet::new()));
     refresh_revoked(ce, &revoked).await;
 
-    let mut seen: HashSet<u64> = HashSet::new();
-    let mut last_revoked_refresh = std::time::Instant::now();
-    tokio::pin!(shutdown);
-
-    let mut backoff_ms = 250u64;
-    loop {
-        let stream = match ce.messages_stream().await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "serve: messages_stream open failed; backing off");
-                tokio::select! {
-                    _ = &mut shutdown => break,
-                    _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
-                }
-                backoff_ms = (backoff_ms * 2).min(10_000);
-                continue;
-            }
-        };
-        backoff_ms = 250;
-        tokio::pin!(stream);
-
-        loop {
-            tokio::select! {
-                _ = &mut shutdown => return Ok(()),
-                item = stream.next() => {
-                    match item {
-                        Some(Ok(m)) => {
-                            if last_revoked_refresh.elapsed() > Duration::from_secs(10) {
-                                refresh_revoked(ce, &revoked).await;
-                                last_revoked_refresh = std::time::Instant::now();
-                            }
-                            handle_stream_message(ce, runtime, &revoked, &mut seen, &m).await;
-                        }
-                        Some(Err(e)) => {
-                            tracing::warn!(error = %e, "serve: stream error; reconnecting");
-                            break;
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+    let handler = InvokeHandler { ce, runtime, revoked, last_refresh: Mutex::new(Instant::now()) };
+    ce_rs::serve::serve(ce, &[crate::protocol::INVOKE_TOPIC], &handler, shutdown).await
 }
 
-async fn handle_stream_message<R: HandlerRuntime>(
-    ce: &ce_rs::CeClient,
-    runtime: &Runtime<R>,
-    revoked: &std::sync::Arc<std::sync::Mutex<HashSet<(NodeId, u64)>>>,
-    seen: &mut HashSet<u64>,
-    m: &ce_rs::AppMessage,
-) {
-    if m.topic != crate::protocol::INVOKE_TOPIC {
-        return;
-    }
-    let Some(token) = m.reply_token else { return };
-    if !seen.insert(token) {
-        return; // already answered
-    }
-    // Cap the de-dup set so a long-lived server does not grow it unbounded.
-    if seen.len() > 100_000 {
-        seen.clear();
-        seen.insert(token);
-    }
+/// The ce-fn invoke handler plugged into the shared [`ce_rs::serve`] loop: it authorizes the
+/// requester (ce-cap), resolves secrets, runs the handler, and encodes the [`InvokeResponse`].
+struct InvokeHandler<'a, R: HandlerRuntime> {
+    ce: &'a ce_rs::CeClient,
+    runtime: &'a Runtime<R>,
+    revoked: std::sync::Arc<std::sync::Mutex<HashSet<(NodeId, u64)>>>,
+    last_refresh: std::sync::Mutex<std::time::Instant>,
+}
 
-    let resp = build_response(runtime, revoked, &m.from, &m.payload_hex).await;
-    let bytes = resp.encode().unwrap_or_else(|_| {
-        // Encoding a response should never fail; if it somehow does, send a minimal failure.
-        InvokeResponse::failure("internal: response encode failed")
-            .encode()
-            .unwrap_or_default()
-    });
-    if let Err(e) = ce.reply(token, &bytes).await {
-        tracing::warn!(error = %e, "serve: reply failed");
+impl<R: HandlerRuntime> ce_rs::serve::Handler for InvokeHandler<'_, R> {
+    async fn handle(&self, req: ce_rs::serve::Request) -> Vec<u8> {
+        // Refresh the revoked set at most every ~10s, lazily on the request path.
+        let stale = self
+            .last_refresh
+            .lock()
+            .map(|g| g.elapsed() > Duration::from_secs(10))
+            .unwrap_or(true);
+        if stale {
+            refresh_revoked(self.ce, &self.revoked).await;
+            if let Ok(mut g) = self.last_refresh.lock() {
+                *g = std::time::Instant::now();
+            }
+        }
+        let resp = build_response(self.runtime, &self.revoked, &req.from, &req.payload).await;
+        resp.encode().unwrap_or_else(|_| {
+            // Encoding a response should never fail; if it somehow does, send a minimal failure.
+            InvokeResponse::failure("internal: response encode failed")
+                .encode()
+                .unwrap_or_default()
+        })
     }
 }
 
@@ -408,17 +367,13 @@ async fn build_response<R: HandlerRuntime>(
     runtime: &Runtime<R>,
     revoked: &std::sync::Arc<std::sync::Mutex<HashSet<(NodeId, u64)>>>,
     from_hex: &str,
-    payload_hex: &str,
+    payload: &[u8],
 ) -> InvokeResponse {
     let requester: NodeId = match hex::decode(from_hex).ok().and_then(|b| b.try_into().ok()) {
         Some(id) => id,
         None => return InvokeResponse::failure("bad sender node id"),
     };
-    let bytes = match hex::decode(payload_hex) {
-        Ok(b) => b,
-        Err(_) => return InvokeResponse::failure("bad request payload hex"),
-    };
-    let req = match InvokeRequest::decode(&bytes) {
+    let req = match InvokeRequest::decode(payload) {
         Ok(r) => r,
         Err(e) => return InvokeResponse::failure(format!("malformed invoke request: {e}")),
     };

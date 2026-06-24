@@ -14,7 +14,7 @@ name = "ce-fn"
 path = "src/bin/ce-fn.rs"
 
 [dependencies]
-ce-rs = { path = "../ce-rs" }
+ce-rs = { path = "../ce-rs", features = ["serve"] }
 ce-cap = { path = "../ce/crates/ce-cap" }
 ce-identity = { path = "../ce/crates/ce-identity" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "process", "io-util"] }
