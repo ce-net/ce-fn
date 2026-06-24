@@ -1,12 +1,14 @@
 //! ce-fn — serverless functions on the CE mesh.
 //!
-//! Deploy a container or WASM handler, invoke it on atlas-ranked hosts over the mesh, and bind it
-//! to pubsub topics as event triggers. A thin CLI over the [`ce_fn`] library; all state lives in a
-//! local JSON registry so deploy/invoke/on/kill are stateful across runs.
+//! Deploy a container or WASM handler, invoke it on atlas-ranked hosts over the mesh, bind it to
+//! pubsub topics as event triggers, and run the host-side runtime that executes handlers. A thin CLI
+//! over the [`ce_fn`] library; all client state lives in a local JSON registry so
+//! deploy/invoke/on/kill are stateful across runs.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use ce_fn::caps::{ABILITY_DEPLOY, ABILITY_INVOKE, grant};
-use ce_fn::{Function, FnClient, Handler, Registry, TriggerEvent};
+use ce_fn::serve::{HandlerManifest, ProcessRuntime, Runtime, ServeConfig, serve_loop};
+use ce_fn::{Function, FnClient, Handler, Registry, SecretRef, TriggerEvent};
 use ce_rs::{Amount, CeClient};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -29,7 +31,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Deploy a function: pick the best atlas-ranked host and place the handler.
+    /// Deploy a function: pick the top atlas-ranked hosts and place the handler.
     ///
     /// Container: ce-fn deploy resize --image myorg/resize:latest -- /bin/resize
     /// WASM:      ce-fn deploy thumb  --wasm <module-hash> --entry _start
@@ -57,10 +59,20 @@ enum Cmd {
         /// Per-invocation bid in whole credits.
         #[arg(long, default_value = "1")]
         bid: u64,
+        /// Number of replica cells to place across distinct hosts.
+        #[arg(long, default_value = "1")]
+        replicas: u32,
         /// Require hosts advertising this capability self-tag (repeatable, e.g. --select gpu).
         #[arg(long)]
         select: Vec<String>,
-        /// Pin to a specific host node id instead of atlas selection.
+        /// Set an environment variable for the handler: --env KEY=VALUE (repeatable).
+        #[arg(long, value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Bind a host secret to an env var: --secret ENV=HOST_SOURCE (repeatable). The value is
+        /// resolved on the host at launch and never stored in the registry.
+        #[arg(long, value_name = "ENV=SOURCE")]
+        secret: Vec<String>,
+        /// Pin to a specific host node id instead of atlas selection (forces replicas=1).
         #[arg(long)]
         host: Option<String>,
         /// Container command override (after `--`).
@@ -89,19 +101,45 @@ enum Cmd {
         /// Function name.
         name: String,
     },
+    /// Drop a deployment record WITHOUT killing its cells (for unreachable hosts; cells expire).
+    Forget {
+        /// Function name.
+        name: String,
+    },
     /// List deployed functions.
     Ls,
+    /// Show detailed status for one deployed function (replicas, revision, invocation stats).
+    Describe {
+        /// Function name.
+        name: String,
+    },
+    /// Show invocation accounting (call count, error rate, last call) for deployed functions.
+    Logs {
+        /// Optional function name; omit to show all.
+        name: Option<String>,
+    },
     /// List candidate hosts from the atlas (those able to run functions).
     Hosts {
         /// Only show hosts advertising this self-tag.
         #[arg(long)]
         select: Option<String>,
     },
-    /// Mint a capability token authorizing another node to deploy/invoke on this node.
+    /// Run the host-side runtime: answer ce-fn/invoke requests by executing declared handlers.
     ///
-    /// The token is signed by an identity key file (--key); print it and hand it to the audience,
-    /// who passes it via --cap. With no --key, this errors (the node's signing key is not exposed
-    /// over HTTP — use `ce grant` for node-rooted grants).
+    /// Requires a handler manifest (JSON) declaring the function -> command mappings this host
+    /// will serve. See docs/serve-protocol.md and examples/handlers.json.
+    Serve {
+        /// Path to the handler manifest JSON file.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Path to an accepted-roots file (64-hex node ids, one per line). Optional.
+        #[arg(long)]
+        roots: Option<PathBuf>,
+        /// This host's atlas self-tags (repeatable) — consulted for tag-scoped capabilities.
+        #[arg(long)]
+        tag: Vec<String>,
+    },
+    /// Mint a capability token authorizing another node to deploy/invoke on this node.
     Grant {
         /// Audience node id (64-hex) receiving the capability.
         audience: String,
@@ -111,8 +149,7 @@ enum Cmd {
         /// Expiry in seconds from now (0 = never).
         #[arg(long, default_value = "0")]
         expires: u64,
-        /// Path to an identity directory containing `node.key` (e.g. `~/.local/share/ce/identity`).
-        /// The capability is signed by that key (the issuer/root).
+        /// Path to an identity directory containing `node.key`.
         #[arg(long)]
         key: PathBuf,
         /// Capability nonce (issuer-unique; names it for revocation).
@@ -123,6 +160,7 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
     let cli = Cli::parse();
     let ce = CeClient::new(cli.node.clone());
     let reg_path = cli.registry.clone().unwrap_or_else(Registry::default_path);
@@ -130,9 +168,13 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Deploy {
-            name, image, wasm, entry, cpu, mem, duration, bid, select, host, command,
+            name, image, wasm, entry, cpu, mem, duration, bid, replicas, select, env, secret, host,
+            command,
         } => {
             let handler = build_handler(&image, &wasm, &entry, command)?;
+            let env = parse_env(&env)?;
+            let secrets = parse_secrets(&secret)?;
+            let replicas = if host.is_some() { 1 } else { replicas.max(1) };
             let f = Function {
                 name: name.clone(),
                 handler,
@@ -141,18 +183,25 @@ async fn main() -> Result<()> {
                 duration_secs: duration,
                 bid: Amount::from_credits(bid),
                 select,
+                env,
+                secrets,
+                replicas,
             };
+            f.validate()?;
+
+            // Mutate the registry under an advisory lock so concurrent deploys do not clobber.
             let registry = Registry::load(&reg_path)?;
             let mut fns = FnClient::new(ce, registry);
-
             let dep = match &host {
                 Some(h) => fns.deploy_on(f, h, cap.as_deref()).await?,
                 None => fns.deploy(f, cap.as_deref()).await?,
             };
             fns.registry().save(&reg_path)?;
-            println!("deployed '{}' on {}", dep.function.name, short(&dep.host));
-            println!("  job   {}", dep.job_id);
-            println!("  bid   {} credits / invocation", dep.function.bid.credits());
+            println!("deployed '{}' (rev {})", dep.function.name, dep.revision);
+            for r in &dep.replicas {
+                println!("  replica  {}  job {}", short(&r.host), short(&r.job_id));
+            }
+            println!("  bid      {} credits / invocation", dep.function.bid.credits());
             println!("invoke it with: ce-fn invoke {} --data '...'", name);
         }
 
@@ -162,15 +211,19 @@ async fn main() -> Result<()> {
                 None => read_stdin()?,
             };
             let registry = Registry::load(&reg_path)?;
-            let fns = FnClient::new(ce, registry);
-            let out = fns.invoke_with(&name, &payload, cap.as_deref(), ce_fn::DEFAULT_INVOKE_TIMEOUT_MS).await?;
+            let mut fns = FnClient::new(ce, registry);
+            let out =
+                fns.invoke_with(&name, &payload, cap.as_deref(), ce_fn::DEFAULT_INVOKE_TIMEOUT_MS).await;
+            // Persist updated invocation stats regardless of outcome.
+            let _ = fns.registry().save(&reg_path);
+            let out = out?;
             use std::io::Write;
             std::io::stdout().write_all(&out)?;
         }
 
         Cmd::On { topic, name } => {
             let registry = Registry::load(&reg_path)?;
-            let fns = FnClient::new(ce, registry);
+            let mut fns = FnClient::new(ce, registry);
             println!("binding '{name}' to topic '{topic}' (ctrl-c to stop)...");
             let on_result = |ev: &TriggerEvent, outcome: &Result<Vec<u8>>| match outcome {
                 Ok(out) => println!("  event on '{}' -> {} bytes", ev.topic, out.len()),
@@ -180,6 +233,7 @@ async fn main() -> Result<()> {
                 let _ = tokio::signal::ctrl_c().await;
             };
             fns.run_trigger(&name, &topic, cap.as_deref(), on_result, shutdown).await?;
+            let _ = fns.registry().save(&reg_path);
             println!("trigger stopped.");
         }
 
@@ -188,7 +242,15 @@ async fn main() -> Result<()> {
             let mut fns = FnClient::new(ce, registry);
             let dep = fns.kill(&name, cap.as_deref()).await?;
             fns.registry().save(&reg_path)?;
-            println!("killed '{}' (job {})", name, short(&dep.job_id));
+            println!("killed '{}' ({} replica(s))", name, dep.replica_count());
+        }
+
+        Cmd::Forget { name } => {
+            Registry::with_lock(&reg_path, |r| {
+                r.remove(&name).ok_or_else(|| anyhow!("no deployed function named '{name}'"))?;
+                Ok(())
+            })?;
+            println!("forgot '{name}' (its cells will expire on their own).");
         }
 
         Cmd::Ls => {
@@ -198,17 +260,84 @@ async fn main() -> Result<()> {
                 println!("no deployed functions (registry: {})", reg_path.display());
                 return Ok(());
             }
-            println!("{:<24}  {:<10}  {:<14}  {:>6}  HOST", "NAME", "KIND", "RESOURCES", "BID");
+            println!(
+                "{:<20}  {:<9}  {:<12}  {:>4}  {:>4}  {:>5}  HOST",
+                "NAME", "KIND", "RESOURCES", "REPL", "REV", "BID"
+            );
             for d in deps {
                 let kind = if d.function.handler.is_wasm() { "wasm" } else { "container" };
                 let res = format!("{}c/{}M", d.function.cpu_cores, d.function.mem_mb);
                 println!(
-                    "{:<24}  {:<10}  {:<14}  {:>6}  {}",
+                    "{:<20}  {:<9}  {:<12}  {:>4}  {:>4}  {:>5}  {}",
                     d.function.name,
                     kind,
                     res,
+                    d.replica_count(),
+                    d.revision,
                     d.function.bid.credits(),
-                    short(&d.host),
+                    short(d.host()),
+                );
+            }
+        }
+
+        Cmd::Describe { name } => {
+            let registry = Registry::load(&reg_path)?;
+            let d = registry
+                .get(&name)
+                .ok_or_else(|| anyhow!("no deployed function named '{name}'"))?;
+            let kind = if d.function.handler.is_wasm() { "wasm" } else { "container" };
+            println!("function   {}", d.function.name);
+            println!("kind       {kind}");
+            match &d.function.handler {
+                Handler::Container { image, cmd } => {
+                    println!("image      {image}");
+                    if !cmd.is_empty() {
+                        println!("command    {}", cmd.join(" "));
+                    }
+                }
+                Handler::Wasm { module_hash, entry } => {
+                    println!("module     {module_hash}");
+                    println!("entry      {entry}");
+                }
+            }
+            println!("resources  {} cores / {} MiB / {}s", d.function.cpu_cores, d.function.mem_mb, d.function.duration_secs);
+            println!("bid        {} credits", d.function.bid.credits());
+            println!("revision   {}", d.revision);
+            if !d.function.env.is_empty() {
+                println!("env        {}", d.function.env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(","));
+            }
+            if !d.function.secrets.is_empty() {
+                println!("secrets    {}", d.function.secrets.iter().map(|s| s.env.as_str()).collect::<Vec<_>>().join(","));
+            }
+            println!("replicas   {}", d.replica_count());
+            for (i, r) in d.replicas.iter().enumerate() {
+                println!("  [{i}] host {}  job {}", short(&r.host), short(&r.job_id));
+            }
+            println!(
+                "stats      {} invocations, {} errors, last {}ms",
+                d.stats.invocations, d.stats.errors, d.stats.last_latency_ms
+            );
+        }
+
+        Cmd::Logs { name } => {
+            let registry = Registry::load(&reg_path)?;
+            let deps: Vec<_> = match &name {
+                Some(n) => registry.get(n).into_iter().collect(),
+                None => registry.list(),
+            };
+            if deps.is_empty() {
+                println!("no matching deployments.");
+                return Ok(());
+            }
+            println!("{:<20}  {:>10}  {:>8}  {:>9}  {:>12}", "NAME", "INVOKES", "ERRORS", "LAST(ms)", "LAST(unix)");
+            for d in deps {
+                println!(
+                    "{:<20}  {:>10}  {:>8}  {:>9}  {:>12}",
+                    d.function.name,
+                    d.stats.invocations,
+                    d.stats.errors,
+                    d.stats.last_latency_ms,
+                    d.stats.last_invoked,
                 );
             }
         }
@@ -233,18 +362,47 @@ async fn main() -> Result<()> {
             }
         }
 
+        Cmd::Serve { manifest, roots, tag } => {
+            let manifest = HandlerManifest::load(&manifest)?;
+            let status = ce.status().await?;
+            let self_id: ce_identity::NodeId = hex::decode(&status.node_id)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| anyhow!("node returned a bad node id"))?;
+            let root_keys = match &roots {
+                Some(p) => load_roots(p)?,
+                None => vec![],
+            };
+            let config = ServeConfig { roots: root_keys, self_tags: tag, roots_path: roots };
+            let runtime = Runtime::new(self_id, manifest, ProcessRuntime, config);
+            println!(
+                "ce-fn serving as {} — handlers: [{}]",
+                short(&status.node_id),
+                runtime.functions().join(", ")
+            );
+            let shutdown = async {
+                let _ = tokio::signal::ctrl_c().await;
+            };
+            serve_loop(&ce, &runtime, shutdown).await?;
+            println!("serve stopped.");
+        }
+
         Cmd::Grant { audience, can, expires, key, nonce } => {
             let issuer = load_identity(&key)?;
             let aud = parse_node_id(&audience)?;
             let abilities = parse_abilities(&can)?;
             let not_after = if expires == 0 { 0 } else { now_secs() + expires };
-            // Resource::Any: the audience may act on any node under the issuer's authority. Narrow
-            // it in app policy if needed; abilities are the primary scope here.
             let token = grant(&issuer, aud, &abilities, ce_cap::Resource::Any, not_after, nonce);
             println!("{token}");
         }
     }
     Ok(())
+}
+
+fn init_tracing() {
+    use tracing_subscriber::{EnvFilter, fmt};
+    let filter = EnvFilter::try_from_env("CE_FN_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
+    let _ = fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
 }
 
 /// Build a [`Handler`] from the `--image`/`--wasm` flags, rejecting ambiguous/empty combinations.
@@ -267,6 +425,36 @@ fn build_handler(
     }
 }
 
+/// Parse `KEY=VALUE` env pairs.
+fn parse_env(items: &[String]) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for item in items {
+        let (k, v) = item
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--env must be KEY=VALUE (got '{item}')"))?;
+        if k.is_empty() {
+            bail!("--env key must not be empty (got '{item}')");
+        }
+        out.push((k.to_string(), v.to_string()));
+    }
+    Ok(out)
+}
+
+/// Parse `ENV=SOURCE` secret bindings.
+fn parse_secrets(items: &[String]) -> Result<Vec<SecretRef>> {
+    let mut out = Vec::new();
+    for item in items {
+        let (env, from) = item
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--secret must be ENV=SOURCE (got '{item}')"))?;
+        if env.is_empty() || from.is_empty() {
+            bail!("--secret must be ENV=SOURCE with both sides non-empty (got '{item}')");
+        }
+        out.push(SecretRef { env: env.to_string(), from: from.to_string() });
+    }
+    Ok(out)
+}
+
 /// Map the comma-separated `--can` list to ce-fn abilities.
 fn parse_abilities(can: &str) -> Result<Vec<&'static str>> {
     let mut out = Vec::new();
@@ -284,19 +472,28 @@ fn parse_abilities(can: &str) -> Result<Vec<&'static str>> {
 }
 
 fn parse_node_id(hex_str: &str) -> Result<ce_identity::NodeId> {
-    let bytes = hex::decode(hex_str.trim()).map_err(|_| anyhow::anyhow!("node id is not hex"))?;
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("node id must be 32 bytes (64 hex chars)"))?;
+    let bytes = hex::decode(hex_str.trim()).map_err(|_| anyhow!("node id is not hex"))?;
+    let arr: [u8; 32] =
+        bytes.try_into().map_err(|_| anyhow!("node id must be 32 bytes (64 hex chars)"))?;
     Ok(arr)
 }
 
-/// Load an Ed25519 identity from a directory containing `node.key`. Accepts either the identity
-/// directory itself or its parent (a `node.key` is searched for directly under `path`). If the
-/// directory has no key yet, one is generated (matching how the node bootstraps its identity).
+/// Load accepted capability root keys (64-hex node ids, one per line, `#` comments).
+fn load_roots(path: &std::path::Path) -> Result<Vec<ce_identity::NodeId>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow!("reading roots file {}: {e}", path.display()))?;
+    Ok(text
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .filter_map(|h| hex::decode(h).ok().and_then(|b| b.try_into().ok()))
+        .collect())
+}
+
+/// Load an Ed25519 identity from a directory containing `node.key`.
 fn load_identity(path: &std::path::Path) -> Result<ce_identity::Identity> {
     ce_identity::Identity::load_or_generate(path)
-        .map_err(|e| anyhow::anyhow!("loading identity from {}: {e}", path.display()))
+        .map_err(|e| anyhow!("loading identity from {}: {e}", path.display()))
 }
 
 fn read_stdin() -> Result<Vec<u8>> {
@@ -306,8 +503,8 @@ fn read_stdin() -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn short(s: &str) -> String {
-    s.chars().take(12).collect()
+fn short(s: &str) -> &str {
+    if s.len() > 12 { &s[..12] } else { s }
 }
 
 fn now_secs() -> u64 {
@@ -315,4 +512,49 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_env_pairs() {
+        let got = parse_env(&["A=1".into(), "B=x=y".into()]).unwrap();
+        assert_eq!(got, vec![("A".into(), "1".into()), ("B".into(), "x=y".into())]);
+        assert!(parse_env(&["noeq".into()]).is_err());
+        assert!(parse_env(&["=v".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_secret_bindings() {
+        let got = parse_secrets(&["TOK=HOST_TOK".into()]).unwrap();
+        assert_eq!(got[0].env, "TOK");
+        assert_eq!(got[0].from, "HOST_TOK");
+        assert!(parse_secrets(&["bad".into()]).is_err());
+        assert!(parse_secrets(&["A=".into()]).is_err());
+    }
+
+    #[test]
+    fn build_handler_rejects_ambiguous() {
+        assert!(build_handler(&Some("a".into()), &Some("b".into()), "_start", vec![]).is_err());
+        assert!(build_handler(&None, &None, "_start", vec![]).is_err());
+        assert!(build_handler(&None, &Some("h".into()), "_start", vec!["x".into()]).is_err());
+        assert!(build_handler(&Some("img".into()), &None, "_start", vec!["c".into()]).is_ok());
+    }
+
+    #[test]
+    fn parse_abilities_maps_and_rejects() {
+        assert_eq!(parse_abilities("invoke").unwrap(), vec![ABILITY_INVOKE]);
+        assert_eq!(parse_abilities("deploy,invoke").unwrap(), vec![ABILITY_DEPLOY, ABILITY_INVOKE]);
+        assert!(parse_abilities("bogus").is_err());
+        assert!(parse_abilities("").is_err());
+    }
+
+    #[test]
+    fn parse_node_id_validates() {
+        assert!(parse_node_id(&"a".repeat(64)).is_ok());
+        assert!(parse_node_id(&"a".repeat(63)).is_err());
+        assert!(parse_node_id("nothex").is_err());
+    }
 }

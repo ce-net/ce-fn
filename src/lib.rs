@@ -28,19 +28,20 @@
 //! let registry = Registry::load(&Registry::default_path())?;
 //! let mut fns = FnClient::new(CeClient::local(), registry);
 //!
-//! // Deploy a container function on the best atlas-ranked host.
+//! // Deploy a container function across the top atlas-ranked hosts.
 //! let f = Function {
 //!     name: "resize".into(),
 //!     handler: Handler::Container { image: "myorg/resize:latest".into(), cmd: vec![] },
 //!     cpu_cores: 1, mem_mb: 256, duration_secs: 120,
 //!     bid: bid_credits(1), select: vec![],
+//!     env: vec![("LOG".into(), "info".into())], secrets: vec![], replicas: 2,
 //! };
 //! let dep = fns.deploy(f, None).await?;
 //! fns.registry().save(&Registry::default_path())?;
 //!
-//! // Invoke it (HTTP-style request/response over the mesh).
+//! // Invoke it (HTTP-style request/response over the mesh, load-balanced across replicas).
 //! let out = fns.invoke("resize", b"<image bytes>").await?;
-//! println!("{} bytes back from {}", out.len(), dep.host);
+//! println!("{} bytes back from {}", out.len(), dep.host());
 //! # Ok(()) }
 //! ```
 //!
@@ -51,11 +52,18 @@ pub mod client;
 pub mod function;
 pub mod placement;
 pub mod protocol;
+pub mod serve;
 
-pub use client::{DEFAULT_INVOKE_TIMEOUT_MS, FnClient, bid_credits};
-pub use function::{Deployment, Function, Handler, Registry};
+pub use client::{DEFAULT_INVOKE_ATTEMPTS, DEFAULT_INVOKE_TIMEOUT_MS, FnClient, bid_credits};
+pub use function::{Deployment, DeploymentStats, Function, Handler, Registry, Replica, SecretRef};
 pub use placement::{Candidate, Requirements};
-pub use protocol::{INVOKE_TOPIC, InvokeRequest, InvokeResponse, TriggerEvent};
+pub use protocol::{
+    INVOKE_TOPIC, InvokeRequest, InvokeResponse, MAX_OUTPUT_BYTES, MAX_PAYLOAD_BYTES, TriggerEvent,
+};
+pub use serve::{
+    HandlerManifest, HandlerOutcome, HandlerRuntime, HandlerSpec, ProcessRuntime, Runtime,
+    ServeConfig, serve_loop,
+};
 
 // Re-export the money type so callers need not also depend on ce-rs just for `Amount`.
 pub use ce_rs::Amount;

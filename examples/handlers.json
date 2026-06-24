@@ -1,0 +1,22 @@
+{
+  "default_timeout_secs": 60,
+  "handlers": [
+    {
+      "function": "echo",
+      "command": ["/bin/cat"],
+      "timeout_secs": 10
+    },
+    {
+      "function": "upper",
+      "command": ["/usr/bin/tr", "a-z", "A-Z"],
+      "timeout_secs": 10
+    },
+    {
+      "function": "greet",
+      "command": ["python3", "examples/handler.py"],
+      "env": [["GREETING", "hello"]],
+      "secrets": [{ "env": "API_TOKEN", "from": "CE_FN_API_TOKEN" }],
+      "timeout_secs": 30
+    }
+  ]
+}

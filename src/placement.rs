@@ -106,6 +106,19 @@ pub fn best(
     rank(pool, 1, reputation).into_iter().next()
 }
 
+/// Filter `atlas` by `req` and return the top `count` ranked candidates (most-proven first). Used by
+/// `deploy` to place `replicas` cells across distinct hosts and to keep a fallback list when the
+/// top host fails between the atlas read and the deploy (the documented placement TOCTOU). Pure.
+pub fn top(
+    atlas: Vec<AtlasEntry>,
+    req: &Requirements,
+    count: usize,
+    reputation: impl Fn(&str) -> u64,
+) -> Vec<Candidate> {
+    let pool = candidates(atlas, req);
+    rank(pool, count, reputation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +230,33 @@ mod tests {
         let atlas = vec![host("a", 1, 64, 0, &["linux"])];
         let req = Requirements::for_container(1, 64, vec![]);
         assert!(best(atlas, &req, |_| 0).is_none());
+    }
+
+    #[test]
+    fn top_returns_ranked_n_distinct_hosts() {
+        let atlas = vec![
+            host("nodocker", 4, 1024, 0, &["linux"]),
+            host("a", 4, 1024, 0, &["docker"]),
+            host("b", 4, 1024, 0, &["docker"]),
+            host("c", 4, 1024, 0, &["docker"]),
+        ];
+        let req = Requirements::for_container(1, 128, vec![]);
+        let rep = |id: &str| match id {
+            "a" => 100,
+            "b" => 50,
+            _ => 1,
+        };
+        let chosen = top(atlas, &req, 2, rep);
+        assert_eq!(chosen.len(), 2);
+        assert_eq!(chosen[0].host.node_id, "a");
+        assert_eq!(chosen[1].host.node_id, "b");
+    }
+
+    #[test]
+    fn top_caps_to_available_pool() {
+        let atlas = vec![host("a", 4, 1024, 0, &["docker"])];
+        let req = Requirements::for_container(1, 128, vec![]);
+        let chosen = top(atlas, &req, 5, |_| 0);
+        assert_eq!(chosen.len(), 1);
     }
 }
