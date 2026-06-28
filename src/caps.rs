@@ -10,7 +10,7 @@
 //! a configured root key instead of self.
 
 use anyhow::{Result, anyhow};
-use ce_cap::{Caveats, Resource, SignedCapability, authorize, decode_chain, encode_chain};
+use ce_iam_core::{Caveats, Resource, SignedCapability, authorize, decode_chain, encode_chain};
 use ce_identity::{Identity, NodeId};
 
 /// Ability: may deploy/place a function.
@@ -57,7 +57,7 @@ pub fn authorize_invoke(
     requester: &NodeId,
     action: &str,
     token: &str,
-    is_revoked: &dyn Fn(&NodeId, u64) -> bool,
+    is_revoked: &(dyn Fn(&NodeId, u64) -> bool + Sync),
 ) -> Result<()> {
     let chain = decode_chain(token).map_err(|e| anyhow!("bad capability token: {e}"))?;
     authorize(self_id, accepted_roots, self_tags, now, requester, action, &chain, is_revoked)

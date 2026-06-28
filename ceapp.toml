@@ -1,0 +1,29 @@
+# ce-fn — serverless functions (FaaS) over CE jobs + atlas. Installed + supervised by the one `ce` node via ce-appmgr.
+
+[app]
+name    = "ce-fn"
+version = "0.1.0"
+summary = "Serverless functions over CE: deploy a container/WASM handler, atlas-place it, invoke or pubsub-trigger over the mesh."
+runtime = "native"
+publisher = "c0be11e0ce0aaa769da6f9970244947d3d32a0c0d8302fb5f41f73d7950be456"
+provides = ["function-runtime"]
+
+[native]
+bin = "ce-fn"
+[native.artifacts]
+"darwin-amd64" = "PLACEHOLDER_darwin_amd64"
+"linux-amd64"  = "PLACEHOLDER_linux_amd64"
+
+[deps]
+# Drives the local ce node (ce-rs serve); cap-gated via ce-iam-core; runs handler containers/WASM.
+
+[sandbox]
+tier       = "none"
+net        = "loopback"
+capability = "inherit"
+
+[daemon]
+# `serve` is the host-side runtime answering ce-fn/invoke requests (requires a handler manifest).
+enabled = true
+args    = ["serve"]
+restart = "on-failure"

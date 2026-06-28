@@ -392,7 +392,7 @@ async fn main() -> Result<()> {
             let aud = parse_node_id(&audience)?;
             let abilities = parse_abilities(&can)?;
             let not_after = if expires == 0 { 0 } else { now_secs() + expires };
-            let token = grant(&issuer, aud, &abilities, ce_cap::Resource::Any, not_after, nonce);
+            let token = grant(&issuer, aud, &abilities, ce_iam_core::Resource::Any, not_after, nonce);
             println!("{token}");
         }
     }

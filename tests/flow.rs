@@ -215,7 +215,7 @@ async fn end_to_end_invoke_through_runtime() {
         &host,
         caller.node_id(),
         &[ABILITY_INVOKE],
-        ce_cap::Resource::Node(host.node_id()),
+        ce_iam_core::Resource::Node(host.node_id()),
         0,
         1,
     );

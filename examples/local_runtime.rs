@@ -7,7 +7,7 @@
 //! This is the same dispatch path `ce-fn serve` uses on a host; only the message transport (the
 //! node's AppRequest/reply) is elided here.
 
-use ce_cap::Resource;
+use ce_iam_core::Resource;
 use ce_fn::caps::{ABILITY_INVOKE, grant};
 use ce_fn::serve::{HandlerManifest, HandlerSpec, ProcessRuntime, Runtime, ServeConfig};
 use ce_fn::{InvokeRequest, InvokeResponse};

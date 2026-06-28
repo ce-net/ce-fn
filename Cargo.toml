@@ -14,9 +14,9 @@ name = "ce-fn"
 path = "src/bin/ce-fn.rs"
 
 [dependencies]
-ce-rs = { path = "../ce-rs", features = ["serve"] }
-ce-cap = { path = "../ce/crates/ce-cap" }
-ce-identity = { path = "../ce/crates/ce-identity" }
+ce-rs = { git = "https://github.com/ce-net/ce-rs", features = ["serve"] }
+ce-iam-core = { git = "https://github.com/ce-net/ce-iam" }
+ce-identity = { git = "https://github.com/ce-net/ce" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "process", "io-util"] }
 anyhow = "1"
 directories = "5"

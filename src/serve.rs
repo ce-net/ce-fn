@@ -62,7 +62,7 @@ impl HandlerSpec {
     /// `lookup` resolves a secret's host source name to its value (defaults to `std::env::var`).
     pub fn resolve_env(
         &self,
-        lookup: &dyn Fn(&str) -> Option<String>,
+        lookup: &(dyn Fn(&str) -> Option<String> + Sync),
     ) -> Result<Vec<(String, String)>> {
         let mut out: Vec<(String, String)> = self.env.clone();
         for s in &self.secrets {
@@ -135,18 +135,20 @@ pub struct HandlerOutcome {
 /// The seam between the runtime's request dispatch and the actual handler execution mechanism.
 /// The real implementation ([`ProcessRuntime`]) spawns a subprocess; tests substitute a deterministic
 /// fake so the whole invoke path is exercised offline.
-#[allow(async_fn_in_trait)]
 pub trait HandlerRuntime: Send + Sync {
     /// Run `spec`'s handler with `payload` on stdin, the resolved `env`, and a wall-clock `timeout`.
     /// Returns the captured stdout + exit code, or an error if the handler could not be launched or
     /// exceeded the timeout.
-    async fn run(
+    ///
+    /// The future is `Send` so the shared `ce_rs::serve` loop (which requires a `Send` handler
+    /// future) can drive any `HandlerRuntime`. `async fn` impls satisfy this RPITIT bound.
+    fn run(
         &self,
         spec: &HandlerSpec,
         payload: &[u8],
         env: &[(String, String)],
         timeout: Duration,
-    ) -> Result<HandlerOutcome>;
+    ) -> impl std::future::Future<Output = Result<HandlerOutcome>> + Send;
 }
 
 /// The real handler runtime: spawns the handler command as a local subprocess, writes the payload to
@@ -262,8 +264,8 @@ impl<R: HandlerRuntime> Runtime<R> {
         requester: &NodeId,
         req: &InvokeRequest,
         now: u64,
-        is_revoked: &dyn Fn(&NodeId, u64) -> bool,
-        secret_lookup: &dyn Fn(&str) -> Option<String>,
+        is_revoked: &(dyn Fn(&NodeId, u64) -> bool + Sync),
+        secret_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
     ) -> InvokeResponse {
         match self.try_handle(requester, req, now, is_revoked, secret_lookup).await {
             Ok(outcome) => InvokeResponse::exited(&outcome.output, outcome.exit_code),
@@ -276,8 +278,8 @@ impl<R: HandlerRuntime> Runtime<R> {
         requester: &NodeId,
         req: &InvokeRequest,
         now: u64,
-        is_revoked: &dyn Fn(&NodeId, u64) -> bool,
-        secret_lookup: &dyn Fn(&str) -> Option<String>,
+        is_revoked: &(dyn Fn(&NodeId, u64) -> bool + Sync),
+        secret_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
     ) -> Result<HandlerOutcome> {
         req.validate()?;
         let spec = self
@@ -475,7 +477,7 @@ mod tests {
             host,
             caller.node_id(),
             &[ABILITY_INVOKE],
-            ce_cap::Resource::Node(host.node_id()),
+            ce_iam_core::Resource::Node(host.node_id()),
             0,
             1,
         )
